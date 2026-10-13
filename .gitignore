@@ -1,0 +1,13 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Swift / Xcode
+.build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+.swiftpm/
+
+# macOS
+.DS_Store

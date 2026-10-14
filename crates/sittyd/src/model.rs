@@ -234,6 +234,15 @@ impl Model {
         }
     }
 
+    pub fn set_cmd(&mut self, pane: &str, cmd: Vec<String>, title: String) {
+        if let Some(p) = self.panes.get_mut(pane) {
+            p.cmd = cmd;
+            if p.title.is_empty() {
+                p.title = title;
+            }
+        }
+    }
+
     pub fn rename_tab(&mut self, tab: &str, title: &str) -> Result<(), RpcError> {
         let t = self.tabs.get_mut(tab).ok_or_else(|| err(ErrorKind::NoSuchTab, tab))?;
         t.title = title.into();

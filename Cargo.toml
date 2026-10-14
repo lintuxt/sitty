@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = ["crates/sitty-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lintuxt/sitty"
+
+[workspace.dependencies]
+alacritty_terminal = "0.26"
+portable-pty = "0.9"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+tempfile = "3"
+anyhow = "1"
+sitty-core = { path = "crates/sitty-core" }
+sitty-proto = { path = "crates/sitty-proto" }

@@ -1,0 +1,8 @@
+[package]
+name = "sitty-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+alacritty_terminal.workspace = true

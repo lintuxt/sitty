@@ -205,6 +205,58 @@ fn garbage_line_gets_error_and_connection_survives() {
     let mut line = String::new();
     r.read_line(&mut line).unwrap();
     assert!(line.contains("INVALID_PARAMS"), "{line}");
+    // The connection is still usable: a valid hello now succeeds.
+    let hello = json!({"jsonrpc":"2.0","id":1,"method":"hello","params":{"protocol_version":1,"client":"x"}});
+    writeln!(w, "{hello}").unwrap();
+    line.clear();
+    r.read_line(&mut line).unwrap();
+    assert!(line.contains("\"result\"") && !line.contains("error"), "{line}");
+}
+
+#[test]
+fn closed_harness_pane_loses_its_rights() {
+    let d = Daemon::start();
+    let (mut h, ws, _, pane) = setup(&d);
+    let mut claude = d.as_pane(d.token_of(&mut h, &pane));
+    h.call::<_, Value>("pane.close", json!({"pane": pane})).unwrap();
+    let e = claude.call::<_, TabOpened>("tab.open", json!({"workspace": ws})).unwrap_err();
+    assert_eq!(kind(e), ErrorKind::PermissionRequired);
+    let e = claude.call::<_, Value>("status.set", json!({"state": "idle"})).unwrap_err();
+    assert_eq!(kind(e), ErrorKind::PermissionRequired);
+    // Read-only methods still work.
+    claude.call::<_, Roster>("roster", json!({})).unwrap();
+}
+
+#[test]
+fn harness_pane_open_with_tab_appends_to_that_tab() {
+    let d = Daemon::start();
+    let (mut h, ws, _, pane) = setup(&d);
+    let t2: TabOpened = h.call("tab.open", json!({"workspace": ws, "cmd": ["/bin/cat"]})).unwrap();
+    let mut claude = d.as_pane(d.token_of(&mut h, &pane));
+    let opened: PaneOpened = claude.call("pane.open", json!({"tab": t2.tab, "cmd": ["/bin/cat"]})).unwrap();
+    assert_eq!(opened.tab, t2.tab);
+}
+
+#[test]
+fn existing_user_dir_is_not_chmodded() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let sock = dir.path().join("s.sock");
+    let _l = sittyd::server::prepare_socket(&sock).unwrap();
+    let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o755);
+
+    // A group/world-writable dir is refused outright.
+    let bad = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(bad.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    let e = sittyd::server::prepare_socket(&bad.path().join("s.sock")).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+
+    // A missing dir is created 0700.
+    let fresh = dir.path().join("new");
+    let _l2 = sittyd::server::prepare_socket(&fresh.join("s.sock")).unwrap();
+    assert_eq!(std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777, 0o700);
 }
 
 #[test]

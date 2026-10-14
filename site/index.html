@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sitty — a terminal for AI harnesses</title>
+<meta name="description" content="sitty is an open-source macOS terminal built to host AI harnesses — Claude Code, Codex, Aider, your own scripts — and to be hacked by them. In development.">
+<meta name="theme-color" content="#0c0d10">
+<meta property="og:title" content="sitty">
+<meta property="og:description" content="A terminal built to host AI harnesses — and to be hacked by them.">
+<meta property="og:url" content="https://sitty.si/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0c0d10;
+    --panel: #121419;
+    --panel-2: #171a20;
+    --line: #23272f;
+    --text: #e6e8eb;
+    --muted: #8b919b;
+    --faint: #5b616b;
+    --accent: #f2b45a;
+    --ok: #7fd1a0;
+    --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Inter", "Helvetica Neue", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.55 var(--sans);
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  a { color: inherit; }
+  main {
+    flex: 1;
+    width: 100%;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 72px 16px 48px;
+  }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font: 500 12px/1 var(--mono);
+    color: var(--accent);
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+    border-radius: 999px;
+    padding: 6px 10px;
+    letter-spacing: .02em;
+  }
+  .badge::before {
+    content: "";
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--accent);
+    animation: pulse 2s ease-in-out infinite;
+  }
+  h1 {
+    font: 700 clamp(56px, 12vw, 104px)/1 var(--mono);
+    letter-spacing: -0.04em;
+    margin: 24px 0 8px;
+  }
+  h1 .cursor {
+    display: inline-block;
+    width: .5em; height: .82em;
+    background: var(--accent);
+    margin-left: .06em;
+    vertical-align: -0.06em;
+    animation: blink 1.1s steps(1) infinite;
+  }
+  .say { font: 400 14px/1.4 var(--mono); color: var(--faint); margin: 0 0 28px; }
+  .pitch {
+    font-size: clamp(20px, 3.2vw, 26px);
+    line-height: 1.35;
+    max-width: 30ch;
+    margin: 0 0 16px;
+    letter-spacing: -0.01em;
+  }
+  .sub { color: var(--muted); max-width: 58ch; margin: 0 0 32px; }
+  .ctas { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 64px; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    font: 500 14px/1 var(--mono);
+    text-decoration: none;
+    padding: 12px 16px;
+    border-radius: 8px;
+    border: 1px solid var(--line);
+    background: var(--panel);
+    transition: border-color .15s, background .15s;
+  }
+  .btn:hover { border-color: var(--faint); }
+  .btn.primary { background: var(--accent); color: #17130b; border-color: var(--accent); }
+  .btn.primary:hover { background: #f6c47a; }
+  .btn svg { width: 16px; height: 16px; flex: none; }
+
+  /* --- mock terminal --- */
+  .mock-label { font: 400 12px/1 var(--mono); color: var(--faint); margin: 0 0 10px; }
+  .win {
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--panel);
+    overflow: hidden;
+    box-shadow: 0 30px 80px -30px rgba(0,0,0,.7);
+    font: 400 12.5px/1.6 var(--mono);
+  }
+  .bar {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel-2);
+  }
+  .dot { width: 11px; height: 11px; border-radius: 50%; background: #3a3f48; }
+  .tabs { display: flex; gap: 4px; margin-left: 12px; overflow: hidden; }
+  .tab { padding: 3px 10px; border-radius: 6px; color: var(--faint); white-space: nowrap; }
+  .tab.on { background: var(--bg); color: var(--text); }
+  .body { display: grid; grid-template-columns: 180px 1fr; min-height: 320px; }
+  .side { border-right: 1px solid var(--line); padding: 12px; color: var(--muted); }
+  .side h4 { font: 500 11px/1 var(--mono); color: var(--faint); text-transform: uppercase; letter-spacing: .08em; margin: 4px 0 10px; }
+  .who { display: flex; align-items: center; gap: 8px; padding: 4px 0; white-space: nowrap; }
+  .who i { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+  .who .w { background: var(--accent); animation: pulse 1.6s ease-in-out infinite; }
+  .who .i { background: var(--ok); }
+  .who .h { background: var(--muted); }
+  .who small { color: var(--faint); margin-left: auto; }
+  .who.child { padding-left: 14px; }
+  .main { display: grid; grid-template-rows: 1fr auto; min-width: 0; }
+  .panes { display: grid; grid-template-columns: 1fr 1fr; min-width: 0; }
+  .pane { padding: 12px 14px; min-width: 0; overflow: hidden; white-space: pre; color: var(--muted); }
+  .pane + .pane { border-left: 1px solid var(--line); }
+  .pane b { color: var(--text); font-weight: 500; }
+  .pane .a { color: var(--accent); }
+  .pane .g { color: var(--ok); }
+  .pane .ttl { color: var(--faint); display: block; margin-bottom: 6px; }
+  .chan { border-top: 1px solid var(--line); padding: 10px 14px; background: var(--panel-2); color: var(--muted); }
+  .chan .ttl { color: var(--faint); }
+  .chan p { margin: 4px 0 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .chan b { color: var(--accent); font-weight: 500; }
+  .chan em { font-style: normal; color: var(--ok); }
+
+  .points {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px;
+    margin: 56px 0 0; padding: 0; list-style: none;
+  }
+  .points h3 { font: 500 14px/1.3 var(--mono); margin: 0 0 6px; }
+  .points p { margin: 0; color: var(--muted); font-size: 15px; }
+
+  footer {
+    max-width: 960px; width: 100%; margin: 0 auto;
+    padding: 24px 16px 40px;
+    color: var(--faint); font: 400 12px/1.6 var(--mono);
+    display: flex; flex-wrap: wrap; gap: 8px 24px; justify-content: space-between;
+  }
+  footer a { color: var(--muted); text-decoration: none; }
+  footer a:hover { color: var(--text); }
+
+  @keyframes blink { 50% { opacity: 0; } }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before { animation: none !important; }
+  }
+  @media (max-width: 720px) {
+    main { padding-top: 48px; }
+    .body { grid-template-columns: 1fr; }
+    .side { border-right: 0; border-bottom: 1px solid var(--line); }
+    .panes { grid-template-columns: 1fr; }
+    .pane + .pane { border-left: 0; border-top: 1px solid var(--line); }
+    .points { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <span class="badge">in development</span>
+  <h1>sitty<span class="cursor" aria-hidden="true"></span></h1>
+  <p class="say">si + tty — say it “city”</p>
+
+  <p class="pitch">A terminal built to host AI harnesses — and to be hacked by them.</p>
+  <p class="sub">An open-source macOS terminal for Claude Code, Codex, Aider and your own scripts. Harnesses can open panes, show you what they’re doing, talk to each other in a shared channel, and everything keeps running when you close the window.</p>
+
+  <div class="ctas">
+    <a class="btn primary" href="https://github.com/lintuxt/sitty">
+      <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 .25a.75.75 0 0 1 .673.418l1.882 3.815 4.21.612a.75.75 0 0 1 .416 1.279l-3.046 2.97.719 4.192a.75.75 0 0 1-1.088.791L8 12.347l-3.766 1.98a.75.75 0 0 1-1.088-.79l.72-4.194L.818 6.374a.75.75 0 0 1 .416-1.28l4.21-.611L7.327.668A.75.75 0 0 1 8 .25Z"/></svg>
+      Star on GitHub
+    </a>
+    <a class="btn" href="https://github.com/lintuxt/sitty/subscription">
+      <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 2c1.981 0 3.671.992 4.933 2.078 1.27 1.091 2.187 2.345 2.637 3.023a1.62 1.62 0 0 1 0 1.798c-.45.678-1.367 1.932-2.637 3.023C11.67 13.008 9.981 14 8 14c-1.981 0-3.671-.992-4.933-2.078C1.797 10.83.88 9.576.43 8.898a1.62 1.62 0 0 1 0-1.798c.45-.677 1.367-1.931 2.637-3.022C4.33 2.992 6.019 2 8 2ZM1.679 7.932a.12.12 0 0 0 0 .136c.411.622 1.241 1.75 2.366 2.717C5.176 11.758 6.527 12.5 8 12.5c1.473 0 2.825-.742 3.955-1.715 1.124-.967 1.954-2.096 2.366-2.717a.12.12 0 0 0 0-.136c-.412-.621-1.242-1.75-2.366-2.717C10.824 4.242 9.473 3.5 8 3.5c-1.473 0-2.825.742-3.955 1.715-1.124.967-1.954 2.096-2.366 2.717ZM8 10a2 2 0 1 1-.001-3.999A2 2 0 0 1 8 10Z"/></svg>
+      Watch progress
+    </a>
+  </div>
+
+  <p class="mock-label">// mock — what we’re building</p>
+  <div class="win" role="img" aria-label="Mock of the sitty window: a sidebar lists two harnesses and their panes, two panes run side by side, and a channel at the bottom shows the harnesses messaging each other.">
+    <div class="bar" aria-hidden="true">
+      <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+      <div class="tabs"><span class="tab on">api-refactor</span><span class="tab">docs</span><span class="tab">+</span></div>
+    </div>
+    <div class="body" aria-hidden="true">
+      <div class="side">
+        <h4>workspace · demo</h4>
+        <div class="who"><i class="w"></i>claude <small>working</small></div>
+        <div class="who child"><i class="w"></i>tests <small>62%</small></div>
+        <div class="who"><i class="i"></i>codex <small>idle</small></div>
+        <div class="who"><i class="h"></i>you <small>human</small></div>
+      </div>
+      <div class="main">
+        <div class="panes">
+<div class="pane"><span class="ttl">claude · p3</span><b>❯</b> refactor the auth module
+<span class="a">●</span> Reading src/auth/*.rs
+<span class="a">●</span> Opening a pane for the tests…
+  <span class="g">sitty pane open --down</span>
+  <span class="g">  -- cargo test auth</span>
+<span class="a">●</span> Waiting for tests to finish</div>
+<div class="pane"><span class="ttl">tests · p7  (owned by claude)</span>running 24 tests
+test auth::token ... <span class="g">ok</span>
+test auth::session ... <span class="g">ok</span>
+test auth::expiry ... <span class="g">ok</span>
+test auth::refresh ... <span class="g">ok</span>
+test auth::revoke ... <b>▍</b></div>
+        </div>
+        <div class="chan">
+          <span class="ttl"># demo</span>
+          <p><b>claude</b> auth refactor is up — @codex can you review src/auth?</p>
+          <p><em>codex</em> on it. reading p3 now.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <ul class="points">
+    <li><h3>Any harness</h3><p>Claude Code, Codex, Aider or a shell script. If it runs in a terminal, it runs in sitty.</p></li>
+    <li><h3>See who runs what</h3><p>Every harness, the panes it opened and what it’s doing right now, in one sidebar.</p></li>
+    <li><h3>Built to be driven</h3><p>A local API, a CLI and MCP let harnesses open panes, read output and message each other.</p></li>
+  </ul>
+</main>
+<footer>
+  <span>sitty · open source (MIT or Apache-2.0) · macOS</span>
+  <a href="https://github.com/lintuxt/sitty">github.com/lintuxt/sitty</a>
+</footer>
+</body>
+</html>

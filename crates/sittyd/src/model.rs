@@ -216,7 +216,22 @@ impl Model {
     }
 
     pub fn owns_all_panes(&self, who: &Principal, tab: &str) -> bool {
-        self.panes_in_tab(tab).iter().all(|p| self.can_control_pane(who, p))
+        let panes = self.panes_in_tab(tab);
+        !panes.is_empty() && panes.iter().all(|p| self.can_control_pane(who, p))
+    }
+
+    /// Roll back a tab that never received its first pane. No-op if the tab has a layout.
+    pub fn discard_empty_tab(&mut self, tab: &str) {
+        if self.tabs.get(tab).is_none_or(|t| t.layout.is_some()) {
+            return;
+        }
+        let t = self.tabs.remove(tab).unwrap();
+        if let Some(w) = self.workspaces.get_mut(&t.workspace) {
+            w.tabs.retain(|x| x != tab);
+            if w.focused_tab.as_deref() == Some(tab) {
+                w.focused_tab = w.tabs.last().cloned();
+            }
+        }
     }
 
     pub fn rename_tab(&mut self, tab: &str, title: &str) -> Result<(), RpcError> {
@@ -262,12 +277,13 @@ impl Model {
                     .tabs
                     .iter()
                     .filter_map(|t| self.tabs.get(t))
-                    .map(|t| TabInfo {
+                    .filter_map(|t| Some((t, t.layout.clone()?)))
+                    .map(|(t, layout)| TabInfo {
                         id: t.id.clone(),
                         title: t.title.clone(),
                         owner: t.owner.clone(),
                         focused_pane: t.focused_pane.clone(),
-                        layout: t.layout.clone().expect("tabs always hold at least one pane"),
+                        layout,
                         panes: self
                             .panes_in_tab(&t.id)
                             .iter()
@@ -385,5 +401,53 @@ mod tests {
         assert_eq!(m.roster(Some("w9"), |_| None).unwrap_err().kind(), Some(ErrorKind::NoSuchWorkspace));
         assert_eq!(m.add_tab("w9", "x", HUMAN.into()).unwrap_err().kind(), Some(ErrorKind::NoSuchWorkspace));
         assert_eq!(m.remove_pane("p99").unwrap_err().kind(), Some(ErrorKind::NoSuchPane));
+    }
+
+    #[test]
+    fn roster_skips_layoutless_tab() {
+        let mut m = fixture();
+        m.add_tab("w1", "empty", HUMAN.into()).unwrap();
+        let r = m.roster(None, |_| None).unwrap();
+        assert_eq!(r[0].tabs.len(), 1);
+        assert_eq!(r[0].tabs[0].id, "t2");
+    }
+
+    #[test]
+    fn owns_all_panes_false_for_empty_or_missing_tab() {
+        let mut m = fixture();
+        let t = m.add_tab("w1", "empty", HUMAN.into()).unwrap();
+        assert!(!m.owns_all_panes(&Principal::Human, &t));
+        assert!(!m.owns_all_panes(&Principal::Human, "t99"));
+        assert!(!m.owns_all_panes(&Principal::External, &t));
+    }
+
+    #[test]
+    fn discard_empty_tab_only_removes_empty() {
+        let mut m = fixture();
+        let t = m.add_tab("w1", "empty", HUMAN.into()).unwrap();
+        m.discard_empty_tab(&t);
+        assert!(m.tab(&t).is_none());
+        assert_eq!(m.workspace("w1").unwrap().tabs, vec!["t2"]);
+        assert_eq!(m.workspace("w1").unwrap().focused_tab.as_deref(), Some("t2"));
+        m.discard_empty_tab("t2");
+        assert!(m.tab("t2").is_some());
+    }
+
+    #[test]
+    fn can_control_tab_denials() {
+        let mut m = fixture();
+        let t = m.add_tab("w1", "logs", "p4".into()).unwrap();
+        m.add_pane(&t, None, np("p4", "tokx")).unwrap();
+        assert!(!m.can_control_tab(&harness(&m, "p5"), &t));
+        assert!(!m.can_control_tab(&Principal::External, &t));
+    }
+
+    #[test]
+    fn tab_owned_by_removed_pane_passes_to_human() {
+        let mut m = fixture();
+        let t = m.add_tab("w1", "logs", "p4".into()).unwrap();
+        m.add_pane(&t, None, np(HUMAN, "tokx")).unwrap();
+        m.remove_pane("p4").unwrap();
+        assert_eq!(m.tab(&t).unwrap().owner, HUMAN);
     }
 }

@@ -1,11 +1,12 @@
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use sitty_core::{AlacrittyTerminal, Size, Terminal, Transcript};
 use tokio::sync::watch;
 
@@ -13,6 +14,8 @@ const SCROLLBACK_LINES: usize = 10_000;
 const TRANSCRIPT_BYTES: usize = 1 << 20;
 /// After the child exits, how long to wait for the reader to drain remaining output.
 const DRAIN_GRACE: Duration = Duration::from_millis(500);
+/// After SIGHUP, how long a killed child gets before the process group is SIGKILLed.
+const KILL_ESCALATION: Duration = Duration::from_secs(2);
 
 pub struct SpawnSpec {
     /// None = the user's login shell.
@@ -33,7 +36,9 @@ pub struct PaneRuntime {
     io: Mutex<PaneIo>,
     changed: watch::Sender<u64>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    /// Child pid; portable-pty runs the child under setsid, so pid == process group id.
+    pid: Option<u32>,
+    exited: Arc<AtomicBool>,
     _master: Mutex<Box<dyn MasterPty + Send>>,
     cmd: Vec<String>,
 }
@@ -70,7 +75,7 @@ impl PaneRuntime {
 
         let mut child = pair.slave.spawn_command(cmd).map_err(to_io)?;
         drop(pair.slave);
-        let killer = child.clone_killer();
+        let pid = child.process_id();
         let mut reader = pair.master.try_clone_reader().map_err(to_io)?;
         let writer = Arc::new(Mutex::new(pair.master.take_writer().map_err(to_io)?));
 
@@ -84,7 +89,8 @@ impl PaneRuntime {
             }),
             changed,
             writer,
-            killer: Mutex::new(killer),
+            pid,
+            exited: Arc::new(AtomicBool::new(false)),
             _master: Mutex::new(pair.master),
             cmd: shown_cmd,
         });
@@ -121,6 +127,7 @@ impl PaneRuntime {
             let code = child.wait().map(|s| s.exit_code() as i32).unwrap_or(-1);
             let _ = drained_rx.recv_timeout(DRAIN_GRACE);
             lock(&w.io).exit_code = Some(code);
+            w.exited.store(true, Ordering::SeqCst);
             w.changed.send_modify(|g| *g += 1);
         });
 
@@ -141,8 +148,30 @@ impl PaneRuntime {
         w.flush()
     }
 
+    /// SIGHUP the child's process group, escalating to SIGKILL after `KILL_ESCALATION`.
+    /// Never blocks. No-op once the child has exited (its pid may be reused).
     pub fn kill(&self) {
-        let _ = lock(&self.killer).kill();
+        let Some(pid) = self.pid else { return };
+        if lock(&self.io).exit_code.is_some() {
+            return;
+        }
+        let pgid = pid as libc::pid_t;
+        // SAFETY: killpg only sends a signal; pgid is the setsid'd child's own group.
+        unsafe { libc::killpg(pgid, libc::SIGHUP) };
+        let exited = Arc::clone(&self.exited);
+        thread::spawn(move || {
+            let deadline = Instant::now() + KILL_ESCALATION;
+            while Instant::now() < deadline {
+                if exited.load(Ordering::SeqCst) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            if !exited.load(Ordering::SeqCst) {
+                // SAFETY: as above.
+                unsafe { libc::killpg(pgid, libc::SIGKILL) };
+            }
+        });
     }
 
     pub fn cmd(&self) -> &[String] {
@@ -208,6 +237,22 @@ mod tests {
         let p = PaneRuntime::spawn(spec(&["/bin/sleep", "60"])).unwrap();
         p.kill();
         wait_exit(&p);
+    }
+
+    #[test]
+    fn kill_escalates_when_hup_is_ignored() {
+        let p = PaneRuntime::spawn(spec(&["/bin/sh", "-c", "trap '' HUP; sleep 60"])).unwrap();
+        std::thread::sleep(Duration::from_millis(300)); // let the trap install
+        p.kill();
+        let start = Instant::now();
+        for _ in 0..200 {
+            if p.io().exit_code.is_some() {
+                assert!(start.elapsed() < Duration::from_secs(5));
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("HUP-ignoring child survived kill()");
     }
 
     #[test]

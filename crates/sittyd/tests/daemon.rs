@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -379,4 +379,70 @@ fn client_disconnect_mid_wait_keeps_pane() {
     read_until(&mut h, &pane, "alive");
     let r: Roster = h.call("roster", json!({})).unwrap();
     assert!(r.workspaces[0].tabs[0].panes.iter().any(|p| p.id == pane && p.alive));
+}
+
+/// Kills (and reaps) every child on drop, including when an assertion panics.
+struct KillOnDrop(Vec<Child>);
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        for k in &mut self.0 {
+            let _ = k.kill();
+            let _ = k.wait();
+        }
+    }
+}
+impl std::ops::Deref for KillOnDrop {
+    type Target = Vec<Child>;
+    fn deref(&self) -> &Vec<Child> {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for KillOnDrop {
+    fn deref_mut(&mut self) -> &mut Vec<Child> {
+        &mut self.0
+    }
+}
+
+/// Several daemons racing for one socket: exactly one survives (the rest exit 2) and the human token
+/// on disk is the survivor's, not one a losing daemon wrote.
+#[test]
+fn concurrent_daemon_start_leaves_exactly_one() {
+    for round in 0..4 {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("sittyd.sock");
+        let mut kids = KillOnDrop(
+            (0..6)
+                .map(|_| Command::new(env!("CARGO_BIN_EXE_sittyd")).env("SITTY_SOCKET", &socket).stderr(Stdio::null()).spawn().unwrap())
+                .collect(),
+        );
+
+        // Losers exit (code 2); the winner keeps running.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut codes = vec![None; kids.len()];
+        while codes.iter().filter(|c| c.is_none()).count() > 1 {
+            assert!(Instant::now() < deadline, "round {round}: losers did not exit");
+            for (i, k) in kids.iter_mut().enumerate() {
+                if codes[i].is_none() {
+                    codes[i] = k.try_wait().unwrap().map(|s| s.code());
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(200)); // let a wrongly-surviving second one show itself
+        for (i, k) in kids.iter_mut().enumerate() {
+            if codes[i].is_none() {
+                codes[i] = k.try_wait().unwrap().map(|s| s.code());
+            }
+        }
+        let running: Vec<usize> = (0..kids.len()).filter(|&i| codes[i].is_none()).collect();
+        assert_eq!(running.len(), 1, "round {round}: exit codes {codes:?}");
+        assert!(codes.iter().flatten().all(|c| *c == Some(2)), "round {round}: exit codes {codes:?}");
+
+        let token = std::fs::read_to_string(paths::human_token_path(&socket)).unwrap();
+        let c = Client::connect(&socket, "test", Some(token.trim().to_string())).unwrap();
+        assert_eq!(*c.principal(), Principal::Human, "round {round}: token on disk is not the survivor's");
+        let pid = std::fs::read_to_string(socket.with_file_name("sittyd.pid")).unwrap();
+        assert_eq!(pid.trim(), kids[running[0]].id().to_string(), "round {round}: pid file is not the survivor's");
+
+    }
 }

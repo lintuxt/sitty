@@ -92,6 +92,25 @@ pub fn prepare_socket(path: &Path) -> io::Result<std::os::unix::net::UnixListene
     prepare_socket_with(path, || Ok(()))
 }
 
+/// Exclusive advisory lock on `sittyd.lock` next to the socket. Held by the starting daemon for the
+/// whole probe -> write token/pid -> bind sequence so racing daemons run that sequence one at a time:
+/// a loser then sees the winner's live socket (AddrInUse) instead of clobbering its token/pid files.
+/// It is released as soon as the socket is bound and listening (std's `bind` also listens), not held for
+/// the daemon's lifetime: a later daemon must reach its liveness probe and exit 2 rather than block.
+fn lock_startup(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path.with_file_name("sittyd.lock"))?;
+    loop {
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(f);
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+}
+
 /// Like `prepare_socket`, running `before_bind` after the liveness check and just before binding, so
 /// files that clients look for next to the socket exist by the time the socket does.
 fn prepare_socket_with(
@@ -101,12 +120,16 @@ fn prepare_socket_with(
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         prepare_dir(dir)?;
     }
+    let _startup_lock = lock_startup(path)?; // released on return, after bind
     if path.exists() {
         match std::os::unix::net::UnixStream::connect(path) {
             Ok(_) => return Err(io::Error::new(io::ErrorKind::AddrInUse, "a sittyd is already running on this socket")),
             // Only a refused/vanished socket is stale; anything else (e.g. EACCES) is a real error.
             Err(e) if matches!(e.kind(), io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound) => {
-                std::fs::remove_file(path)?;
+                match std::fs::remove_file(path) {
+                    Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                    _ => {}
+                }
             }
             Err(e) => return Err(e),
         }

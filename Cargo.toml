@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/sitty-core", "crates/sitty-proto", "crates/sittyd"]
+members = ["crates/sitty-core", "crates/sitty-proto", "crates/sittyd", "crates/sitty-cli"]
 
 [workspace.package]
 version = "0.1.0"

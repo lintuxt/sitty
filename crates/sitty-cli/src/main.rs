@@ -131,9 +131,24 @@ fn token(human: bool, socket: &Path) -> Option<String> {
         return Some(t);
     }
     if human {
-        return std::fs::read_to_string(paths::human_token_path(socket)).ok().map(|t| t.trim().to_string());
+        let path = paths::human_token_path(socket);
+        return match std::fs::read_to_string(&path) {
+            Ok(t) => Some(t.trim().to_string()),
+            Err(e) => {
+                // Not a ClientError: its Display would prefix "io: ".
+                eprintln!("error: cannot read human token at {}: {e}", path.display());
+                std::process::exit(1);
+            }
+        };
     }
     None
+}
+
+/// Daemon-bound paths are resolved against the CLI's cwd; the daemon runs elsewhere.
+fn absolutize(p: Option<String>) -> Result<Option<String>, ClientError> {
+    p.map(|p| std::path::absolute(&p).map(|a| a.to_string_lossy().into_owned()))
+        .transpose()
+        .map_err(ClientError::Io)
 }
 
 fn sittyd_path() -> PathBuf {
@@ -150,13 +165,20 @@ fn start_daemon(socket: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     let log = std::fs::OpenOptions::new().create(true).append(true).open(socket.with_file_name("sittyd.log"))?;
-    Command::new(sittyd_path())
-        .env("SITTY_SOCKET", socket)
+    let mut cmd = Command::new(sittyd_path());
+    cmd.env("SITTY_SOCKET", socket)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(log)
-        .process_group(0)
-        .spawn()?;
+        .current_dir("/");
+    // SAFETY: setsid is async-signal-safe; fully detaches the daemon from the CLI's session.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    cmd.spawn()?;
     Ok(())
 }
 
@@ -186,15 +208,22 @@ fn run(cli: Cli) -> Result<(), ClientError> {
     let v: Value = match cli.cmd {
         Cmd::Whoami => c.call("whoami", json!({}))?,
         Cmd::Roster { workspace } => c.call("roster", json!({"workspace": workspace}))?,
-        Cmd::Workspace(WorkspaceCmd::Open { name, dir }) => c.call("workspace.open", json!({"name": name, "dir": dir}))?,
-        Cmd::Tab(TabCmd::Open { workspace, title, cwd, cmd }) => c.call(
+        Cmd::Workspace(WorkspaceCmd::Open { name, dir }) => {
+            let dir = absolutize(dir)?;
+            c.call("workspace.open", json!({"name": name, "dir": dir}))?
+        }
+        Cmd::Tab(TabCmd::Open { workspace, title, cwd, cmd }) => {
+            let cwd = absolutize(cwd)?;
+            c.call(
             "tab.open",
             json!({"workspace": workspace, "title": title, "cwd": cwd, "cmd": opt_cmd(cmd)}),
-        )?,
+            )?
+        }
         Cmd::Tab(TabCmd::Rename { tab, title }) => c.call("tab.rename", json!({"tab": tab, "title": title}))?,
         Cmd::Tab(TabCmd::Focus { tab }) => c.call("tab.focus", json!({"tab": tab}))?,
         Cmd::Tab(TabCmd::Close { tab }) => c.call("tab.close", json!({"tab": tab}))?,
         Cmd::Pane(PaneCmd::Open { down, tab, of, in_tab, title, cwd, cmd }) => {
+            let cwd = absolutize(cwd)?;
             let placement = if tab { "tab" } else if down { "down" } else { "right" };
             c.call(
                 "pane.open",

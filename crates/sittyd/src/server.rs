@@ -41,6 +41,16 @@ fn params<T: DeserializeOwned>(v: Value) -> Result<T, RpcError> {
     serde_json::from_value(v).map_err(|e| rpc(ErrorKind::InvalidParams, e.to_string()))
 }
 
+/// Daemon-side paths must be absolute: a relative one would resolve against the daemon's cwd.
+fn absolute_param(name: &str, p: &str) -> Result<PathBuf, RpcError> {
+    let path = PathBuf::from(p);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Err(rpc(ErrorKind::InvalidParams, format!("{name} must be an absolute path: {p}")))
+    }
+}
+
 fn to_value<T: serde::Serialize>(t: T) -> Result<Value, RpcError> {
     serde_json::to_value(t).map_err(|e| rpc(ErrorKind::Internal, e.to_string()))
 }
@@ -121,7 +131,14 @@ fn prepare_socket_with(
         prepare_dir(dir)?;
     }
     let _startup_lock = lock_startup(path)?; // released on return, after bind
-    if path.exists() {
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        // Never delete something that is not a socket (SITTY_SOCKET may point at a user's file).
+        if !std::os::unix::fs::FileTypeExt::is_socket(&meta.file_type()) {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!("{} exists and is not a socket; refusing to replace it", path.display()),
+            ));
+        }
         match std::os::unix::net::UnixStream::connect(path) {
             Ok(_) => return Err(io::Error::new(io::ErrorKind::AddrInUse, "a sittyd is already running on this socket")),
             // Only a refused/vanished socket is stale; anything else (e.g. EACCES) is a real error.
@@ -305,7 +322,7 @@ impl Daemon {
         if *who != Principal::Human {
             return Err(rpc(ErrorKind::PermissionRequired, "only the human can open workspaces"));
         }
-        let dir = p.dir.map(PathBuf::from).unwrap_or_else(|| std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| "/".into()));
+        let dir = p.dir.as_deref().map(|d| absolute_param("dir", d)).transpose()?.unwrap_or_else(|| std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| "/".into()));
         let workspace = st.model.open_workspace(&p.name, dir);
         to_value(WorkspaceOpened { workspace })
     }
@@ -345,7 +362,11 @@ impl Daemon {
         cwd: Option<String>,
     ) -> Result<String, RpcError> {
         let ws = st.model.tab(tab).ok_or_else(|| rpc(ErrorKind::NoSuchTab, tab))?.workspace.clone();
-        let cwd = cwd.map(PathBuf::from).unwrap_or_else(|| st.model.workspace(&ws).unwrap().dir.clone());
+        let cwd = cwd
+            .as_deref()
+            .map(|c| absolute_param("cwd", c))
+            .transpose()?
+            .unwrap_or_else(|| st.model.workspace(&ws).unwrap().dir.clone());
         let token = random_token().map_err(|e| rpc(ErrorKind::Internal, e.to_string()))?;
         // Reserve the id first so the env can carry it.
         let id = st.model.add_pane(

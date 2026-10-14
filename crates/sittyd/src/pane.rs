@@ -1,4 +1,5 @@
 use std::io::{Read, Write};
+use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -16,6 +17,18 @@ const TRANSCRIPT_BYTES: usize = 1 << 20;
 const DRAIN_GRACE: Duration = Duration::from_millis(500);
 /// After SIGHUP, how long a killed child gets before the process group is SIGKILLed.
 const KILL_ESCALATION: Duration = Duration::from_secs(2);
+
+/// The pty's foreground process group, if it differs from the leader's (e.g. a shell's job).
+fn foreground_group(leader: libc::pid_t, master_fd: Option<RawFd>) -> Option<libc::pid_t> {
+    // SAFETY: tcgetpgrp only queries the terminal.
+    let fg = unsafe { libc::tcgetpgrp(master_fd?) };
+    (fg > 0 && fg != leader).then_some(fg)
+}
+
+fn group_alive(pgid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 only probes existence.
+    unsafe { libc::killpg(pgid, 0) == 0 }
+}
 
 pub struct SpawnSpec {
     /// None = the user's login shell.
@@ -39,6 +52,11 @@ pub struct PaneRuntime {
     /// Child pid; portable-pty runs the child under setsid, so pid == process group id.
     pid: Option<u32>,
     exited: Arc<AtomicBool>,
+    /// Set the instant `child.wait()` returns: from then on the pid may be reused, so no signals.
+    reaped: Arc<AtomicBool>,
+    /// Raw fd of the pty master (owned by `_master`, which lives as long as the pane), used to find
+    /// the pty's foreground process group.
+    master_fd: Option<RawFd>,
     _master: Mutex<Box<dyn MasterPty + Send>>,
     cmd: Vec<String>,
 }
@@ -76,6 +94,7 @@ impl PaneRuntime {
         let mut child = pair.slave.spawn_command(cmd).map_err(to_io)?;
         drop(pair.slave);
         let pid = child.process_id();
+        let master_fd = pair.master.as_raw_fd();
         let mut reader = pair.master.try_clone_reader().map_err(to_io)?;
         let writer = Arc::new(Mutex::new(pair.master.take_writer().map_err(to_io)?));
 
@@ -91,6 +110,8 @@ impl PaneRuntime {
             writer,
             pid,
             exited: Arc::new(AtomicBool::new(false)),
+            reaped: Arc::new(AtomicBool::new(false)),
+            master_fd,
             _master: Mutex::new(pair.master),
             cmd: shown_cmd,
         });
@@ -125,6 +146,7 @@ impl PaneRuntime {
         let w = Arc::clone(&rt);
         thread::spawn(move || {
             let code = child.wait().map(|s| s.exit_code() as i32).unwrap_or(-1);
+            w.reaped.store(true, Ordering::SeqCst);
             let _ = drained_rx.recv_timeout(DRAIN_GRACE);
             lock(&w.io).exit_code = Some(code);
             w.exited.store(true, Ordering::SeqCst);
@@ -148,28 +170,43 @@ impl PaneRuntime {
         w.flush()
     }
 
-    /// SIGHUP the child's process group, escalating to SIGKILL after `KILL_ESCALATION`.
-    /// Never blocks. No-op once the child has exited (its pid may be reused).
+    /// SIGHUP the child's process group and the pty's foreground job (a shell's job-control child
+    /// lives in its own group), escalating to SIGKILL after `KILL_ESCALATION`.
+    /// Never blocks. No-op once the child has been reaped (its pid may be reused).
     pub fn kill(&self) {
         let Some(pid) = self.pid else { return };
-        if lock(&self.io).exit_code.is_some() {
+        if self.reaped.load(Ordering::SeqCst) || lock(&self.io).exit_code.is_some() {
             return;
         }
         let pgid = pid as libc::pid_t;
+        // The foreground job is captured now: after the leader dies the master can no longer tell us.
+        let fg = foreground_group(pgid, self.master_fd);
         // SAFETY: killpg only sends a signal; pgid is the setsid'd child's own group.
-        unsafe { libc::killpg(pgid, libc::SIGHUP) };
-        let exited = Arc::clone(&self.exited);
+        unsafe {
+            libc::killpg(pgid, libc::SIGHUP);
+            if let Some(fg) = fg {
+                libc::killpg(fg, libc::SIGHUP);
+            }
+        }
+        let reaped = Arc::clone(&self.reaped);
         thread::spawn(move || {
             let deadline = Instant::now() + KILL_ESCALATION;
+            // Done early once the leader is reaped and the foreground job (if any) is gone.
+            let done = || reaped.load(Ordering::SeqCst) && fg.is_none_or(|g| !group_alive(g));
             while Instant::now() < deadline {
-                if exited.load(Ordering::SeqCst) {
+                if done() {
                     return;
                 }
                 thread::sleep(Duration::from_millis(25));
             }
-            if !exited.load(Ordering::SeqCst) {
-                // SAFETY: as above.
-                unsafe { libc::killpg(pgid, libc::SIGKILL) };
+            // SAFETY: as above. Once the leader is reaped its pid may be reused: signal only `fg`.
+            unsafe {
+                if !reaped.load(Ordering::SeqCst) {
+                    libc::killpg(pgid, libc::SIGKILL);
+                }
+                if let Some(fg) = fg {
+                    libc::killpg(fg, libc::SIGKILL);
+                }
             }
         });
     }
@@ -253,6 +290,56 @@ mod tests {
             std::thread::sleep(Duration::from_millis(25));
         }
         panic!("HUP-ignoring child survived kill()");
+    }
+
+    #[test]
+    fn kill_reaches_the_foreground_job() {
+        // Job control puts the inner sh in its own process group, the pty's foreground job; it ignores
+        // HUP, so only a signal to that group (not the leader's) followed by escalation removes it.
+        let script = "set -m; sh -c 'trap \"\" HUP; echo FG=$$; sleep 60' ; :";
+        let p = PaneRuntime::spawn(spec(&["/bin/sh", "-c", script])).unwrap();
+        let mut pid = None;
+        for _ in 0..200 {
+            let t = p.io().transcript.since(0).to_string();
+            if let Some(rest) = t.split("FG=").nth(1)
+                && let Some(n) = rest.lines().next().and_then(|l| l.trim().parse::<i32>().ok())
+            {
+                pid = Some(n);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let pid = pid.expect("inner job never printed its pid");
+        std::thread::sleep(Duration::from_millis(200)); // let the trap install
+        p.kill();
+        let start = Instant::now();
+        loop {
+            // SAFETY: signal 0 only probes existence.
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            if !alive {
+                return;
+            }
+            assert!(start.elapsed() < Duration::from_secs(5), "foreground job {pid} survived kill()");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn cursor_position_reply_reaches_the_pty() {
+        // The child asks for the cursor position; the terminal's reply must be written back to its stdin.
+        let p = PaneRuntime::spawn(spec(&[
+            "/bin/bash",
+            "-c",
+            r#"printf "\033[6n"; IFS= read -rsd R r; echo got${r#*[}"#,
+        ]))
+        .unwrap();
+        for _ in 0..200 {
+            if p.io().transcript.since(0).contains("got1;1") {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("no CPR reply; transcript: {:?}", p.io().transcript.since(0));
     }
 
     #[test]

@@ -446,3 +446,27 @@ fn concurrent_daemon_start_leaves_exactly_one() {
 
     }
 }
+
+#[test]
+fn relative_dir_and_cwd_are_rejected() {
+    let d = Daemon::start();
+    let mut h = d.human();
+    let e = h.call::<_, Value>("workspace.open", json!({"name": "rel", "dir": "relative/dir"})).unwrap_err();
+    assert_eq!(kind(e), ErrorKind::InvalidParams);
+    let w: WorkspaceOpened = h.call("workspace.open", json!({"name": "abs", "dir": "/tmp"})).unwrap();
+    let e = h
+        .call::<_, Value>("tab.open", json!({"workspace": w.workspace, "cwd": "also/relative", "cmd": ["/bin/sh"]}))
+        .unwrap_err();
+    assert_eq!(kind(e), ErrorKind::InvalidParams);
+}
+
+#[test]
+fn non_socket_at_socket_path_is_refused_and_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("precious.txt");
+    std::fs::write(&file, "keep me").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_sittyd")).env("SITTY_SOCKET", &file).output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not a socket"), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "keep me");
+}

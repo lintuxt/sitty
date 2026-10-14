@@ -121,3 +121,37 @@ fn stale_socket_is_replaced() {
     drop(std::os::unix::net::UnixListener::bind(&socket).unwrap()); // leaves a dead socket file
     ok(sitty(&socket, &["roster"]));
 }
+
+#[test]
+fn relative_dir_is_resolved_against_the_cli_cwd() {
+    build_sittyd();
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("s.sock");
+    let _g = Guard(socket.clone());
+    let cwd = tempfile::tempdir().unwrap();
+
+    let o = Command::new(bin("sitty"))
+        .current_dir(cwd.path())
+        .env("SITTY_SOCKET", &socket)
+        .env_remove("SITTY_TOKEN")
+        .args(["--human", "workspace", "open", "demo", "--dir", "."])
+        .output()
+        .unwrap();
+    ok(o);
+    let roster = json(&ok(sitty(&socket, &["roster"])));
+    let got = roster["workspaces"][0]["dir"].as_str().unwrap();
+    assert_eq!(std::fs::canonicalize(got).unwrap(), std::fs::canonicalize(cwd.path()).unwrap());
+}
+
+#[test]
+fn human_without_a_readable_token_fails_loudly() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("s.sock");
+    let _g = Guard(socket.clone());
+    ok(sitty(&socket, &["roster"])); // auto-starts the daemon, which writes the token
+    std::fs::remove_file(socket.with_file_name("human.token")).unwrap();
+    let o = sitty(&socket, &["--human", "roster"]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("error: cannot read human token at"), "stderr: {err}");
+}

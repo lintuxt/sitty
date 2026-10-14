@@ -18,7 +18,7 @@ impl Daemon {
         let socket = dir.path().join("sittyd.sock");
         let child = Command::new(env!("CARGO_BIN_EXE_sittyd")).env("SITTY_SOCKET", &socket).spawn().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !socket.exists() || !paths::human_token_path(&socket).exists() {
+        while std::os::unix::net::UnixStream::connect(&socket).is_err() || !paths::human_token_path(&socket).exists() {
             assert!(Instant::now() < deadline, "daemon did not start");
             std::thread::sleep(Duration::from_millis(20));
         }

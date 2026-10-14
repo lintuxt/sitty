@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use sitty_proto::client::{Client, ClientError};
-use sitty_proto::{ErrorKind, PaneOpened, PaneText, Principal, Roster, TabOpened, WorkspaceOpened, paths};
+use sitty_proto::{ErrorKind, PaneOpened, PaneText, Principal, Roster, TabOpened, WaitResult, WorkspaceOpened, paths};
 
 struct Daemon {
     child: Child,
@@ -298,6 +298,85 @@ fn client_disconnect_mid_request_keeps_pane() {
     drop(reader);
     drop(s);
     read_until(&mut h, &pane, "survivor");
+    let r: Roster = h.call("roster", json!({})).unwrap();
+    assert!(r.workspaces[0].tabs[0].panes.iter().any(|p| p.id == pane && p.alive));
+}
+
+#[test]
+fn wait_for_exit_returns_code() {
+    let d = Daemon::start();
+    let (mut h, ws, _, _) = setup(&d);
+    let t: TabOpened = h.call("tab.open", json!({"workspace": ws, "cmd": ["/bin/sh", "-c", "sleep 0.2; exit 7"]})).unwrap();
+    let r: WaitResult = h.call("pane.wait", json!({"pane": t.pane, "until": "exit"})).unwrap();
+    assert_eq!(r, WaitResult { reason: "exit".into(), exit_code: Some(7), matched: None });
+    // Already exited: returns immediately.
+    let r: WaitResult = h.call("pane.wait", json!({"pane": t.pane, "until": "exit", "timeout_ms": 50})).unwrap();
+    assert_eq!(r.exit_code, Some(7));
+}
+
+#[test]
+fn match_ignores_output_before_wait() {
+    let d = Daemon::start();
+    let (mut h, _, _, pane) = setup(&d);
+    h.call::<_, Value>("pane.send", json!({"pane": pane, "text": "echo REA\"\"DY\r"})).unwrap();
+    // The quotes keep the typed echo of the command from containing READY: only the output does.
+    read_until(&mut h, &pane, "READY");
+    // READY is already on screen; the wait must not return on it.
+    let e = h.call::<_, WaitResult>("pane.wait", json!({"pane": pane, "until": {"match": "READY"}, "timeout_ms": 300})).unwrap_err();
+    assert_eq!(kind(e), ErrorKind::Timeout);
+}
+
+#[test]
+fn match_sees_new_output() {
+    let d = Daemon::start();
+    let (mut h, _, _, pane) = setup(&d);
+    let sock = d.socket.clone();
+    let token = std::fs::read_to_string(paths::human_token_path(&sock)).unwrap();
+    let p2 = pane.clone();
+    let sender = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        let mut c = Client::connect(&sock, "test", Some(token.trim().to_string())).unwrap();
+        c.call::<_, Value>("pane.send", json!({"pane": p2, "text": "echo done-$((6*7))\r"})).unwrap();
+    });
+    let r: WaitResult = h.call("pane.wait", json!({"pane": pane, "until": {"match": "done-\\d+"}})).unwrap();
+    sender.join().unwrap();
+    assert_eq!(r.matched.as_deref(), Some("done-42"));
+}
+
+#[test]
+fn quiet_and_bad_regex() {
+    let d = Daemon::start();
+    let (mut h, _, _, pane) = setup(&d);
+    let r: WaitResult = h.call("pane.wait", json!({"pane": pane, "until": {"quiet": 150}})).unwrap();
+    assert_eq!(r.reason, "quiet");
+    let e = h.call::<_, WaitResult>("pane.wait", json!({"pane": pane, "until": {"match": "("}})).unwrap_err();
+    assert_eq!(kind(e), ErrorKind::InvalidParams);
+}
+
+#[test]
+fn match_on_exited_pane_is_pane_exited() {
+    let d = Daemon::start();
+    let (mut h, ws, _, _) = setup(&d);
+    let t: TabOpened = h.call("tab.open", json!({"workspace": ws, "cmd": ["/bin/sh", "-c", "sleep 0.2"]})).unwrap();
+    let e = h.call::<_, WaitResult>("pane.wait", json!({"pane": t.pane, "until": {"match": "never"}})).unwrap_err();
+    assert_eq!(kind(e), ErrorKind::PaneExited);
+}
+
+#[test]
+fn client_disconnect_mid_wait_keeps_pane() {
+    use std::io::Write;
+    let d = Daemon::start();
+    let (mut h, _, _, pane) = setup(&d);
+    {
+        // Raw connection: hello, start a long wait, then vanish.
+        let token = std::fs::read_to_string(paths::human_token_path(&d.socket)).unwrap();
+        let mut s = std::os::unix::net::UnixStream::connect(&d.socket).unwrap();
+        writeln!(s, r#"{{"jsonrpc":"2.0","id":1,"method":"hello","params":{{"protocol_version":1,"client":"t","token":"{}"}}}}"#, token.trim()).unwrap();
+        writeln!(s, r#"{{"jsonrpc":"2.0","id":2,"method":"pane.wait","params":{{"pane":"{pane}","until":"exit"}}}}"#).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    h.call::<_, Value>("pane.send", json!({"pane": pane, "text": "echo alive\r"})).unwrap();
+    read_until(&mut h, &pane, "alive");
     let r: Roster = h.call("roster", json!({})).unwrap();
     assert!(r.workspaces[0].tabs[0].panes.iter().any(|p| p.id == pane && p.alive));
 }

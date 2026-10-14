@@ -5,3 +5,4 @@ pub mod layout;
 pub mod model;
 pub mod pane;
 pub mod server;
+pub mod wait;

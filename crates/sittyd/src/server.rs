@@ -225,6 +225,16 @@ impl Daemon {
                 .map_err(|e| rpc(ErrorKind::Internal, e.to_string()))?;
             return Ok(json!({}));
         }
+        if req.method == "pane.wait" {
+            // Resolve the runtime under one short-lived guard; the wait itself holds no locks.
+            let w: sitty_proto::PaneWait = params(req.params)?;
+            let rt = {
+                let st = self.lock();
+                Self::live(&st, who)?;
+                st.panes.get(&w.pane).cloned().ok_or_else(|| rpc(ErrorKind::NoSuchPane, w.pane.clone()))?
+            };
+            return to_value(crate::wait::wait(rt, w.until, w.timeout_ms).await?);
+        }
         self.dispatch_locked(who, &req.method, req.params)
     }
 
